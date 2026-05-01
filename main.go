@@ -138,6 +138,9 @@ func cmdObserve(args []string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("flatpak run %s: %w", appID, err)
 	}
+	if err := obs.AddRoot(cmd.Process.Pid); err != nil {
+		return fmt.Errorf("seed tracked set: %w", err)
+	}
 	fmt.Fprintf(os.Stderr, "ratpak: launched %s as PID %d (Ctrl-C to stop)\n", appID, cmd.Process.Pid)
 	fmt.Fprintf(os.Stderr, "ratpak: writing trace to %s\n", w.Path)
 
@@ -386,7 +389,14 @@ func cmdProfile(args []string) error {
 			if err != nil {
 				return fmt.Errorf("read %s: %w", f, err)
 			}
-			sessions = append(sessions, session{label: f, paths: pathSet(recs)})
+			paths := pathSet(recs)
+			if len(paths) == 0 {
+				continue // skip 0-path traces (failed observes, immediate exits)
+			}
+			sessions = append(sessions, session{label: f, paths: paths})
+		}
+		if len(sessions) == 0 {
+			return fmt.Errorf("found %d trace file(s) for %s but all are empty; run 'ratpak observe %s' to capture a real session", len(files), appID, appID)
 		}
 	}
 

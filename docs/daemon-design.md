@@ -228,12 +228,17 @@ For users who don't run a service manager: `ratpak daemon` in a tmux pane works 
 
 Numbered to sort, not to gate: items in earlier phases are prerequisites for everything below.
 
-### P0 — Prerequisites (begin scaffolding)
+### P0 — Prerequisites
 
-1. **`make setcap`** target — daily-use observation as user, no doas/sudo prompt per run. *Scaffolded this session.*
-2. **`flatpak.ResolveAppID(pid int)`** — read `[Application]/name=` from `/proc/<pid>/root/.flatpak-info`. *Scaffolded this session.*
-3. **Kernel-side fork tracking**. Extend `openat.bpf.c` with `sched_process_fork` / `sched_process_exit` hooks and a TGID hash map. Replaces userspace `pidtracker.go`. *Real eBPF work, next session.*
-4. **`internal/daemon/` package skeleton** — package doc, IPC socket-path convention, Server stub. *Scaffolded this session.*
+1. **`make setcap`** target — daily-use observation as user, no doas/sudo prompt per run. *Done.*
+2. **`flatpak.ResolveAppID(pid int)`** — read `[Application]/name=` from `/proc/<pid>/root/.flatpak-info`. *Done.*
+3. **Kernel-side fork tracking** — `tracked_pids` LRU hash + `sched_process_fork` / `sched_process_exit` hooks in `openat.bpf.c`; `Observer.AddRoot(pid)` to seed it. Tracking by kernel TID rather than TGID sidesteps the lack of `task_struct->tgid` in the fork tracepoint context (no vmlinux/BTF dep). The userspace `pidtracker.go` still runs for now — it owns the mntns check, which the BPF program doesn't yet do. *Done; validated against Flatseal.*
+4. **`internal/daemon/` package skeleton** — package doc, IPC socket-path convention, Server stub. *Done.*
+5. **Mount-namespace check in BPF** — read `task->nsproxy->mnt_ns->ns.inum` via CO-RE, compare to a host_mntns_inum global. Lets `pidtracker.go` retire entirely. *Next.*
+
+### Lesson learned during P0 item 3
+
+Different `sched/*` tracepoints use different context-struct layouts (some use `__data_loc` 4-byte encoded comm fields, some use inline `char[16]`). The kernel's verifier rejects sched-tracepoint attaches with `permission denied` — not a verifier-style error message — when a program's field access reads past the actual context size. Always confirm the layout from `/sys/kernel/tracing/events/<group>/<name>/format` before defining the BPF-side struct; don't extrapolate from a sibling tracepoint. Documented in [`docs/observer-ebpf.md`](observer-ebpf.md).
 
 ### P1 — Daemon proper
 
