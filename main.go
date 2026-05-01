@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +18,7 @@ import (
 	"ratpak/internal/flatpak"
 	"ratpak/internal/observer"
 	ebpfobs "ratpak/internal/observer/ebpf"
+	"ratpak/internal/trace"
 )
 
 const usage = `ratpak — flatpak firewall
@@ -29,9 +28,11 @@ usage: ratpak <command> [arguments]
 commands:
   list                       list installed flatpak apps
   info <appid>               show requested permissions and current overrides for an app
-  observe <appid>            launch app under observation, print every path it opens
-  profile <appid> [trace]    classify a captured trace into used / unused / unaccounted
-                             (reads trace from stdin if no file is given)
+  observe <appid>            launch app under observation; saves a jsonl trace under
+                             ~/.local/share/ratpak/traces/<appid>/ and prints paths live
+  profile <appid> [trace]    classify saved traces into used / unused / unaccounted.
+                             With no arg, unions every saved trace for the app.
+                             With a path or '-' (stdin), classifies that single trace.
   apply <appid>              apply minimal overrides based on observation (not yet implemented)
 `
 
@@ -109,6 +110,13 @@ func cmdObserve(args []string) error {
 	}
 	appID := args[0]
 
+	home, uid, gid := invokingUser()
+	w, err := trace.NewWriter(home, appID, uid, gid)
+	if err != nil {
+		return fmt.Errorf("open trace: %w", err)
+	}
+	defer w.Close()
+
 	ctx, cancel := signalContext()
 	defer cancel()
 
@@ -126,6 +134,7 @@ func cmdObserve(args []string) error {
 		return fmt.Errorf("flatpak run %s: %w", appID, err)
 	}
 	fmt.Fprintf(os.Stderr, "ratpak: launched %s as PID %d (Ctrl-C to stop)\n", appID, cmd.Process.Pid)
+	fmt.Fprintf(os.Stderr, "ratpak: writing trace to %s\n", w.Path)
 
 	tracker := observer.NewPIDTracker(cmd.Process.Pid, 50*time.Millisecond)
 	go tracker.Run(ctx)
@@ -150,9 +159,12 @@ func cmdObserve(args []string) error {
 			continue
 		}
 		seen[ev.Path] = struct{}{}
+		if err := w.Add(trace.Record{Path: ev.Path, Comm: ev.Comm, PID: ev.PID}); err != nil {
+			fmt.Fprintf(os.Stderr, "ratpak: warn: trace write: %v\n", err)
+		}
 		fmt.Println(ev.Path)
 	}
-	fmt.Fprintf(os.Stderr, "ratpak: %d unique paths observed\n", len(seen))
+	fmt.Fprintf(os.Stderr, "ratpak: %d unique paths observed; trace saved to %s\n", len(seen), w.Path)
 	return nil
 }
 
@@ -172,47 +184,73 @@ func cmdApply(_ []string) error {
 
 func cmdProfile(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("profile: expected <appid> [trace-file]")
+		return fmt.Errorf("profile: expected <appid> [trace-file|-]")
 	}
 	appID := args[0]
+	home, uid, _ := invokingUser()
 
-	var src io.Reader = os.Stdin
-	if len(args) >= 2 {
-		f, err := os.Open(args[1])
+	type session struct {
+		label string
+		paths map[string]struct{}
+	}
+	var sessions []session
+
+	switch {
+	case len(args) >= 2 && args[1] == "-":
+		recs, err := trace.Read(os.Stdin)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		src = f
+		sessions = []session{{label: "<stdin>", paths: pathSet(recs)}}
+	case len(args) >= 2:
+		recs, err := trace.ReadFile(args[1])
+		if err != nil {
+			return err
+		}
+		sessions = []session{{label: args[1], paths: pathSet(recs)}}
+	default:
+		files, err := trace.ListFiles(home, appID)
+		if err != nil {
+			return fmt.Errorf("list traces: %w", err)
+		}
+		if len(files) == 0 {
+			return fmt.Errorf("no saved traces for %s; run 'ratpak observe %s' first", appID, appID)
+		}
+		for _, f := range files {
+			recs, err := trace.ReadFile(f)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", f, err)
+			}
+			sessions = append(sessions, session{label: f, paths: pathSet(recs)})
+		}
 	}
 
-	paths, err := readTrace(src)
-	if err != nil {
-		return err
+	union := make(map[string]struct{})
+	for _, s := range sessions {
+		for p := range s.paths {
+			union[p] = struct{}{}
+		}
 	}
 
 	requested, err := flatpak.RequestedPermissions(appID)
 	if err != nil {
 		return fmt.Errorf("read manifest: %w", err)
 	}
-
-	home, uid := profileHomeAndUID()
+	autoGrants := flatpak.AutoGrantedPaths(appID, home, uid)
 
 	type grant struct {
-		term flatpak.FilesystemTerm
-		hits []string
+		term        flatpak.FilesystemTerm
+		sessionsHit int // sessions in which at least one path landed under this grant
+		totalHits   int // unique paths in the union under this grant
 	}
-	grants := make([]grant, 0, len(requested.Filesystems))
-	for _, raw := range requested.Filesystems {
-		t, ok := flatpak.ResolveFilesystemTerm(raw, home, uid)
-		_ = ok // unrecognized terms still get listed; they just match nothing
-		grants = append(grants, grant{term: t})
+	grants := make([]grant, len(requested.Filesystems))
+	for i, raw := range requested.Filesystems {
+		t, _ := flatpak.ResolveFilesystemTerm(raw, home, uid)
+		grants[i].term = t
 	}
 
-	autoGrants := flatpak.AutoGrantedPaths(appID, home, uid)
 	var unaccounted []string
-
-	for _, p := range paths {
+	for p := range union {
 		if flatpak.AnyPathUnder(p, autoGrants) {
 			continue
 		}
@@ -223,7 +261,7 @@ func cmdProfile(args []string) error {
 				continue
 			}
 			if flatpak.PathUnder(p, gp) {
-				grants[i].hits = append(grants[i].hits, p)
+				grants[i].totalHits++
 				matched = true
 				break
 			}
@@ -232,9 +270,39 @@ func cmdProfile(args []string) error {
 			unaccounted = append(unaccounted, p)
 		}
 	}
+	sort.Strings(unaccounted)
 
+	for i := range grants {
+		gp := grants[i].term.Path
+		if gp == "" {
+			continue
+		}
+		for _, s := range sessions {
+			for p := range s.paths {
+				if flatpak.PathUnder(p, gp) {
+					grants[i].sessionsHit++
+					break
+				}
+			}
+		}
+	}
+
+	n := len(sessions)
 	fmt.Printf("App: %s\n", appID)
-	fmt.Printf("Trace: %d unique paths\n\n", len(paths))
+	fmt.Printf("Sessions: %d\n", n)
+	listed := sessions
+	truncated := 0
+	if n > 5 {
+		listed = sessions[:3]
+		truncated = n - 3
+	}
+	for _, s := range listed {
+		fmt.Printf("  %s  (%d unique paths)\n", s.label, len(s.paths))
+	}
+	if truncated > 0 {
+		fmt.Printf("  ... %d more\n", truncated)
+	}
+	fmt.Printf("Union: %d unique paths\n\n", len(union))
 
 	fmt.Println("Manifest filesystem grants:")
 	if len(grants) == 0 {
@@ -242,15 +310,15 @@ func cmdProfile(args []string) error {
 	}
 	for _, g := range grants {
 		status := "USED  "
-		count := len(g.hits)
-		if count == 0 {
+		if g.sessionsHit == 0 {
 			status = "UNUSED"
 		}
 		resolved := g.term.Path
 		if resolved == "" {
 			resolved = "(unresolved)"
 		}
-		fmt.Printf("  %s  %-32s → %s  (%d hits)\n", status, g.term.Raw, resolved, count)
+		fmt.Printf("  %s  %-32s → %s  (%d/%d sessions, %d hits)\n",
+			status, g.term.Raw, resolved, g.sessionsHit, n, g.totalHits)
 	}
 	fmt.Println()
 
@@ -265,54 +333,53 @@ func cmdProfile(args []string) error {
 
 	unused := 0
 	for _, g := range grants {
-		if len(g.hits) == 0 && g.term.Path != "" {
+		if g.sessionsHit == 0 && g.term.Path != "" {
 			unused++
 		}
 	}
 	if unused > 0 {
-		fmt.Printf("Recommendation: %d/%d declared filesystem grant(s) had zero hits in this trace — candidates for removal.\n", unused, len(grants))
+		if n == 1 {
+			fmt.Printf("Recommendation: %d/%d declared filesystem grant(s) had zero hits — candidates for removal (caveat: 1 session is not strong evidence; capture more before applying).\n", unused, len(grants))
+		} else {
+			fmt.Printf("Recommendation: %d/%d declared filesystem grant(s) had zero hits across all %d sessions — candidates for removal.\n", unused, len(grants), n)
+		}
 	} else if len(grants) > 0 {
 		fmt.Println("All declared filesystem grants saw use.")
 	}
 	return nil
 }
 
-func readTrace(src io.Reader) ([]string, error) {
-	seen := make(map[string]struct{})
-	var paths []string
-	sc := bufio.NewScanner(src)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+func pathSet(recs []trace.Record) map[string]struct{} {
+	s := make(map[string]struct{}, len(recs))
+	for _, r := range recs {
+		if r.Path != "" {
+			s[r.Path] = struct{}{}
 		}
-		if _, ok := seen[line]; ok {
-			continue
-		}
-		seen[line] = struct{}{}
-		paths = append(paths, line)
 	}
-	return paths, sc.Err()
+	return s
 }
 
-// profileHomeAndUID picks the home directory and uid to interpret xdg-* terms
-// against. When run via sudo/doas we resolve to the invoking user; otherwise
-// we use the current process.
-func profileHomeAndUID() (string, int) {
+// invokingUser returns the home, uid, gid of the user we should attribute
+// trace files (and override writes) to. Under sudo/doas that's the invoking
+// user; otherwise it's the current process's user. Falls back silently to the
+// current process if SUDO_USER lookup fails — caller-side diagnostics are
+// dropPrivilegesForChild's job, not ours.
+func invokingUser() (string, int, int) {
 	name := os.Getenv("SUDO_USER")
 	if name == "" {
 		name = os.Getenv("DOAS_USER")
 	}
 	if name != "" {
 		if u, err := user.Lookup(name); err == nil {
-			if uid, err := strconv.Atoi(u.Uid); err == nil {
-				return u.HomeDir, uid
+			uid, err1 := strconv.Atoi(u.Uid)
+			gid, err2 := strconv.Atoi(u.Gid)
+			if err1 == nil && err2 == nil {
+				return u.HomeDir, uid, gid
 			}
 		}
 	}
 	home, _ := os.UserHomeDir()
-	return home, os.Getuid()
+	return home, os.Getuid(), os.Getgid()
 }
 
 type prefixCount struct {
