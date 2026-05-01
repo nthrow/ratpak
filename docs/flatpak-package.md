@@ -30,11 +30,15 @@ The same parser is reused by `overrides.go`.
 
 ```go
 func UserOverrides(appID string) (*Permissions, error)
+func AddNoFilesystem(appID, term string) error
+func ResetUser(appID string) error
 ```
 
-Reads `~/.local/share/flatpak/overrides/<appid>` (the user-level override file) and parses it the same way as a manifest. Returns an empty `Permissions` if the file doesn't exist (this is not an error).
+`UserOverrides` reads `~/.local/share/flatpak/overrides/<appid>` (the user-level override file) and parses it the same way as a manifest. Returns an empty `Permissions` if the file doesn't exist (this is not an error). System-level overrides at `/var/lib/flatpak/overrides/<appid>` aren't read yet.
 
-System-level overrides at `/var/lib/flatpak/overrides/<appid>` aren't read yet.
+`AddNoFilesystem` shells out to `flatpak override --user --nofilesystem=<term> <appid>` to revoke a filesystem grant. The `term` must be mode-free (e.g. `"xdg-pictures"`, not `"xdg-pictures:ro"`) — flatpak rejects mode suffixes on `--nofilesystem`. Used by `ratpak apply --commit`.
+
+`ResetUser` shells out to `flatpak override --user --reset <appid>`, removing every user override for the app (filesystem, dbus, sockets, …). Used by `ratpak reset --commit`. Granular per-term removal isn't implemented — would require editing the override file directly, since flatpak's CLI offers no fine-grained "remove this single override" verb.
 
 ### `match.go`
 

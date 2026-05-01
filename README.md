@@ -6,13 +6,14 @@ ratpak is a CLI for tightening the runtime permissions of installed flatpak appl
 
 ## Status
 
-Early. v1 covers:
+Early but end-to-end on the filesystem axis. The full loop works:
 
-- Reading a flatpak app's declared filesystem permissions.
-- Tracing successful `openat` calls by the sandboxed app via eBPF.
-- Diffing the trace against the manifest to flag unused (over-broad) grants.
+- Read a flatpak app's declared filesystem permissions.
+- Trace successful `openat` calls by the sandboxed app via eBPF; persist each session as jsonl under `~/.local/share/ratpak/traces/<appid>/`.
+- Aggregate across sessions and diff against the manifest to flag grants that were unused everywhere.
+- Apply minimal overrides via `flatpak override --user --nofilesystem=…`, dry-run by default.
 
-Not done yet: dbus / sockets / devices observers, multi-session aggregation, automatic override application, file-capability UX so root isn't required.
+Not done yet: dbus / sockets / devices observers, file-capability UX so root isn't required for `observe`, dirfd-relative path resolution, kernel-side PID tracking. See [the roadmap](docs/roadmap.md).
 
 ## Requirements
 
@@ -34,43 +35,59 @@ Produces `bin/ratpak`, a fully static x86_64 binary that runs against the host k
 ## Usage
 
 ```
-ratpak list                            # list installed flatpak apps
-ratpak info com.example.App            # show its manifest filesystems + your overrides
-ratpak observe com.example.App > trace # launch under eBPF, write opened paths
-ratpak profile com.example.App trace   # classify trace into used / unused / unaccounted
+ratpak list                                # list installed flatpak apps
+ratpak info com.example.App                # show its manifest filesystems + your overrides
+doas ratpak observe com.example.App        # launch under eBPF; saves trace to ~/.local/share/ratpak/traces/
+ratpak profile com.example.App             # union every saved trace, classify
+ratpak apply com.example.App               # dry-run: show which grants we'd revoke
+ratpak apply com.example.App --commit      # write `flatpak override --nofilesystem=…` for unused grants
+ratpak reset com.example.App --commit      # remove all user overrides for the app
 ```
 
-`observe` requires elevated privileges to load the BPF program; the simplest invocation is `doas ratpak observe …` or `sudo ratpak observe …`. ratpak detects this and runs the actual flatpak app as your real user, so the app sees your user-level installs and session bus.
+`observe` requires elevated privileges to load the BPF program (`doas` or `sudo`). ratpak detects this and runs the actual flatpak app as your real user, so the app sees your user-level installs and session bus. The trace file is also chowned to your user.
+
+`profile`, `apply`, and `reset` run as your normal user. `apply --commit` and `reset --commit` refuse to run as root since overrides go to your user's flatpak config.
 
 ## Example
 
-Discord declares five filesystem grants. After a typical "launch, sign in, scroll, close" session:
+Flatseal — a tightly-permissioned reference app. After two short sessions:
 
 ```
-$ ratpak profile com.discordapp.Discord trace
-App: com.discordapp.Discord
-Trace: 7002 unique paths
+$ ratpak profile com.github.tchx84.Flatseal
+App: com.github.tchx84.Flatseal
+Sessions: 2
+  …/20260501-022711Z.jsonl  (1006 unique paths)
+  …/20260501-022801Z.jsonl  (922 unique paths)
+Union: 1019 unique paths
 
 Manifest filesystem grants:
-  UNUSED  xdg-download                     → /home/nat/Downloads  (0 hits)
-  UNUSED  xdg-pictures:ro                  → /home/nat/Pictures  (0 hits)
-  UNUSED  xdg-videos:ro                    → /home/nat/Videos  (0 hits)
-  UNUSED  xdg-run/pipewire-0               → /run/user/1000/pipewire-0  (0 hits)
-  UNUSED  xdg-run/speech-dispatcher        → /run/user/1000/speech-dispatcher  (0 hits)
+  USED    xdg-data/flatpak/overrides:create → /home/nat/.local/share/flatpak/overrides  (2/2 sessions, 4 hits)
+  UNUSED  /var/lib/flatpak/app:ro          → /var/lib/flatpak/app  (0/2 sessions, 0 hits)
+  USED    xdg-data/flatpak/app:ro          → /home/nat/.local/share/flatpak/app  (2/2 sessions, 383 hits)
 
-Recommendation: 5/5 declared filesystem grant(s) had zero hits in this trace — candidates for removal.
+Recommendation: 1/3 declared filesystem grant(s) had zero hits across all 2 sessions — candidates for removal.
 ```
 
-A single session won't justify revocation by itself — a real recommender wants many sessions across realistic activity (audio call, file upload, etc.) before suggesting tightening. That's the v2 work.
+```
+$ ratpak apply com.github.tchx84.Flatseal
+…
+Would revoke 1 filesystem grant(s) (dry-run; pass --commit to apply):
+  flatpak override --user --nofilesystem=/var/lib/flatpak/app com.github.tchx84.Flatseal
+
+Warning: based on only 2 session(s) of observation. Consider capturing more before --commit.
+```
+
+A single session won't justify revocation by itself; the more sessions you observe across realistic activity (audio call, file upload, etc.), the more confidence you have in revoking a grant. The `K/N sessions` column makes that explicit.
 
 ## Documentation
 
 - [Status & roadmap](docs/roadmap.md) — where v1 stands, what v2 should fix, where to resume
 - [Architecture overview](docs/architecture.md) — terminology and data flow
 - [CLI commands](docs/cli.md)
-- [`internal/flatpak`](docs/flatpak-package.md) — manifest, overrides, term resolution
+- [`internal/flatpak`](docs/flatpak-package.md) — manifest, overrides, term resolution, override writers
 - [`internal/observer`](docs/observer.md) — observer interface + PID/mntns tracking
 - [`internal/observer/ebpf`](docs/observer-ebpf.md) — eBPF program + Go loader
+- [`internal/trace`](docs/trace.md) — jsonl trace persistence and reading
 - [Build environment](docs/build.md) — Dockerfile + Makefile
 
 ## License

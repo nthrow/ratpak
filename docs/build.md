@@ -37,10 +37,12 @@ CGo is disabled (`CGO_ENABLED=0`) so the resulting binary is fully static and ru
 
 ## Running on host
 
-The build container produces a binary; running it requires the host kernel and host privileges:
+The build container produces a binary; running `observe` requires the host kernel and host privileges:
 
 ```
-doas ./bin/ratpak observe com.example.App > /tmp/trace.txt
+doas ./bin/ratpak observe com.example.App
 ```
 
-`sudo` works the same way. ratpak reads `SUDO_USER` or `DOAS_USER` to figure out whose user installs and session bus to expose to the spawned `flatpak run`.
+`sudo` works the same way. ratpak reads `SUDO_USER` or `DOAS_USER` to figure out whose user installs and session bus to expose to the spawned `flatpak run`, and to chown the saved trace file under `~/.local/share/ratpak/traces/<appid>/`.
+
+Other commands (`list`, `info`, `profile`, `apply`, `reset`) run as the regular user — `apply --commit` and `reset --commit` actively refuse to run as root, since user overrides live in the user's flatpak config.

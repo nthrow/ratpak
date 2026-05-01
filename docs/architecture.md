@@ -20,9 +20,11 @@ How ratpak is organized, the terms used in the codebase, and the data flow from 
 
 **Observer** — anything that emits a stream of access events for a running flatpak app. v1 has one filesystem observer backed by eBPF; future observers will cover dbus, sockets, devices.
 
-**Trace** — the captured output of a single observe run. v1 format: one absolute path per line on stdout. Designed to be redirected to a file or piped into the next stage.
+**Trace** — the captured output of a single observe run. Persisted as one jsonl file per session at `~/.local/share/ratpak/traces/<appid>/<UTC-timestamp>Z.jsonl`. Each line is `{"path":"…","comm":"…","pid":N}` for a unique path the sandboxed app opened. Stdout still streams paths live during `observe` for human visibility; the file is the source of truth for downstream stages.
 
-**Profile** — the result of comparing a trace against a manifest. Three buckets: *used* (path matched a granted prefix), *unused* (a grant got zero hits), *unaccounted* (path matched neither a grant nor an auto-grant — interesting for investigation).
+**Session** — the data captured by one `observe` run, persisted as one trace file. `profile` and `apply` aggregate across all sessions stored for an app to make a recommendation.
+
+**Profile** — the result of comparing one or more traces (sessions) against a manifest. Three buckets per path: *used* (path matched a granted prefix), *unaccounted* (path matched neither a grant nor an auto-grant — interesting for investigation), or auto-granted (silent). Per grant: *used* in K/N sessions, *unused* if K=0 across all sessions.
 
 **Sandbox / host mount namespace** — bwrap (the unprivileged sandbox launcher flatpak uses) creates a new mount namespace before exec'ing the app. Processes inside this new namespace see the runtime + app instead of the host's `/usr`, etc. ratpak distinguishes "host mntns" (flatpak's own setup work) from "sandbox mntns" (the actual app) and only counts events from the latter.
 
@@ -59,19 +61,28 @@ How ratpak is organized, the terms used in the codebase, and the data flow from 
                     │   2. PID's mntns ≠ host mntns (i.e. sandboxed)
                     │   3. comm ∉ {bwrap, ldconfig, …}
                     │   4. path is absolute (skip unresolved relative)
+                    │   5. dedup against in-memory seen set
                     ▼
-              one path per line on stdout
+        ┌───────────┴───────────┐
+        ▼                       ▼
+  stdout (live tail)    ~/.local/share/ratpak/traces/<appid>/<ts>.jsonl
 ```
 
-For profiling, the captured trace is then read by `ratpak profile`:
+For profiling, every saved session is read and unioned by `ratpak profile`:
 
 ```
-trace ──┐
-        ├─→ classify each path:
-manifest┘     • under any auto-granted prefix     → ignore
-              • under a manifest-grant prefix     → record hit
-              • neither                           → unaccounted
+session 1 ─┐
+session 2 ─┼─→ union ─┐
+session N ─┘          ├─→ classify each path:
+                      │     • under any auto-granted prefix → ignore
+manifest ─────────────┘     • under a manifest-grant prefix → record hit (per session, per grant)
+                            • neither                       → unaccounted
+
+                            grant report: USED in K/N sessions, M total hits
+                                          UNUSED if K=0 across all sessions
 ```
+
+`ratpak apply` runs the same classification and feeds the unused-grant set into `flatpak override --user --nofilesystem=…`.
 
 ## Layout
 
@@ -85,14 +96,16 @@ ratpak/
 │   ├── flatpak/
 │   │   ├── apps.go               `flatpak list`
 │   │   ├── permissions.go        `flatpak info --show-permissions` parser
-│   │   ├── overrides.go          ~/.local/share/flatpak/overrides parser
+│   │   ├── overrides.go          override file reader + override writers (--nofilesystem, --reset)
 │   │   └── match.go              term resolver + auto-grant list + path matchers
-│   └── observer/
-│       ├── observer.go           Event + Observer interface
-│       ├── pidtracker.go         /proc walker; tracks descendants + mntns
-│       └── ebpf/
-│           ├── openat.bpf.c      kernel-side: 4 tracepoints + ringbuf + LRU pending map
-│           └── observer.go       userspace-side: load, attach, decode events
+│   ├── observer/
+│   │   ├── observer.go           Event + Observer interface
+│   │   ├── pidtracker.go         /proc walker; tracks descendants + mntns
+│   │   └── ebpf/
+│   │       ├── openat.bpf.c      kernel-side: 4 tracepoints + ringbuf + LRU pending map
+│   │       └── observer.go       userspace-side: load, attach, decode events
+│   └── trace/
+│       └── trace.go              jsonl writer/reader; trace dir conventions
 └── docs/
     └── …
 ```
