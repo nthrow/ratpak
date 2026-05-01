@@ -10,13 +10,17 @@ The eBPF-backed implementation of the filesystem observer.
 
 ## Kernel side (`openat.bpf.c`)
 
-Three maps and six programs.
+Three maps, one rodata constant, six programs, and a small `task_struct` chain for CO-RE-based mntns extraction.
 
 ### Maps
 
 - `events` — `BPF_MAP_TYPE_RINGBUF`, 1 MiB. The kernel→userspace event channel.
 - `pending` — `BPF_MAP_TYPE_LRU_HASH`, 8192 entries, key = tid (u32), value = userspace pointer (u64). Per-thread scratch used to pass the filename argument from the enter program to the exit program.
 - `tracked_pids` — `BPF_MAP_TYPE_LRU_HASH`, 16384 entries, key = tid (u32), value = u32 marker. The kernel-side membership filter: only events whose calling tid is in this map flow through to userspace.
+
+### Rodata
+
+- `host_mntns_inum` (u32, `const volatile`) — set by userspace via `VariableSpec.Set` at load time. The mount-namespace inum that ratpak itself runs in. Events from this mntns get filtered out (they're flatpak's own pre-bwrap setup work).
 
 ### Programs
 
@@ -32,7 +36,7 @@ Membership maintenance:
 - `trace_sched_fork`  (tp/sched/sched_process_fork)
 - `trace_sched_exit`  (tp/sched/sched_process_exit)
 
-Both `_enter` programs check `is_tracked()` first; if yes, stash the filename pointer (arg index 1) keyed by tid in `pending`. Both `_exit` programs do the same check, then look up the stashed pointer and, if `ctx->ret >= 0`, copy `{pid, tgid, comm, filename}` into a ringbuf record. The LRU policy means an evicted-mid-syscall stash is safe.
+Both `_enter` programs check `should_emit()` first — true iff the calling tid is in `tracked_pids` AND the calling task's mount-namespace inum (read CO-RE-style from `task->nsproxy->mnt_ns->ns.inum`) differs from `host_mntns_inum`. If yes, stash the filename pointer (arg index 1) keyed by tid in `pending`. Both `_exit` programs do the same check, then look up the stashed pointer and, if `ctx->ret >= 0`, copy `{pid, tgid, comm, filename}` into a ringbuf record. The LRU policy means an evicted-mid-syscall stash is safe.
 
 `trace_sched_fork` runs in the parent's context. If `parent_pid` is in `tracked_pids`, `child_pid` is added — propagating membership across both process and thread clones (since both are by-TID in this map).
 
@@ -72,6 +76,8 @@ Generated bindings via:
 3. Attach all six tracepoints (four syscall + two sched) via `link.Tracepoint`.
 4. Open a ringbuf reader on the `events` map; pin the loaded objects on the Observer so `AddRoot` can write to `tracked_pids`.
 5. Spawn a goroutine that reads records, decodes each into a `rawEvent`, and emits an `observer.Event` on the returned channel.
+
+Before load, `Observe` reads `/proc/self/ns/mnt`'s inum and writes it into the `host_mntns_inum` rodata global via `VariableSpec.Set` — so the BPF mntns check is using ratpak's own mntns as the "host" reference. Assumes ratpak runs in the host mntns; running ratpak inside a sandbox would need a different reference (e.g. PID 1's mntns).
 
 `AddRoot(pid int)` writes `(pid, 1)` into `tracked_pids`. Until at least one `AddRoot` call lands, the kernel-side filter drops every event — the channel will look idle.
 

@@ -1,6 +1,6 @@
 # `internal/observer`
 
-The observation layer above the eBPF program. Defines the public type surface and tracks the descendants of a launched flatpak app.
+The observation layer above the eBPF program. Defines the public type surface for filesystem-access streams.
 
 ## `observer.go`
 
@@ -18,25 +18,8 @@ type Observer interface {
 
 The interface lets future observers (dbus, sockets, devices) plug in without changing callers.
 
-## `pidtracker.go`
+## Process tracking
 
-```go
-type PIDTracker struct { /* … */ }
+Pre-v2 daemon-track work, this package also held a userspace `PIDTracker` that polled `/proc` every 50ms to maintain the set of TGIDs descended from a launched flatpak app and their mount-namespace inums. That has been retired: kernel-side tracking now lives in [`internal/observer/ebpf/openat.bpf.c`](../internal/observer/ebpf/openat.bpf.c) — a BPF hash map seeded by `Observer.AddRoot`, propagated by a `sched_process_fork` hook, reaped by `sched_process_exit`, and combined with a CO-RE-relocated read of `task->nsproxy->mnt_ns->ns.inum` to filter out events from the host mount namespace. Userspace receives a pre-filtered event stream.
 
-func NewPIDTracker(root int, interval time.Duration) *PIDTracker
-func (t *PIDTracker) Run(ctx context.Context)              // blocking poll loop
-func (t *PIDTracker) Includes(pid int) bool                // is pid descended from root?
-func (t *PIDTracker) IsSandboxed(pid int) bool             // descended AND in different mntns
-```
-
-A simple `/proc` poller. Every `interval` it walks `/proc/*/stat` to build a `pid → ppid` map, then for each pid that isn't already tracked, walks the parent chain looking for a tracked ancestor. Newly tracked pids have their mount-namespace inum read once via `stat /proc/<pid>/ns/mnt`.
-
-The root pid's mntns becomes the "host" reference. `IsSandboxed` returns true only for tracked pids whose mntns differs from the host — the actual flatpak'd app processes after bwrap unshares.
-
-A polling interval of 50ms is the current default.
-
-### Limitations
-
-- Short-lived children born and died inside one poll interval can be missed.
-- A pid can be recycled by the kernel during a long observe; entries are never reaped, but the recycled pid is unlikely to coincidentally match a previously-tracked one.
-- Userspace polling means there's a small window between a process's `clone()` and ratpak's `IsSandboxed` answer turning true. Events from that window will fail the filter and be discarded. A future kernel-side improvement would hook `sched_process_fork` and maintain the tracked set in a BPF map.
+See [observer-ebpf.md](observer-ebpf.md) for details on the kernel-side filter.

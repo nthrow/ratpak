@@ -4,6 +4,7 @@
 #include <linux/bpf.h>
 #include <linux/types.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 #define TASK_COMM_LEN 16
 #define MAX_PATH      256
@@ -83,15 +84,53 @@ struct sched_exit_args {
     __s32 prio;                     // offset 28
 };
 
-static __always_inline int is_tracked(void)
+// Minimal task_struct chain for extracting the current mount-namespace
+// inode number. preserve_access_index tells clang to emit CO-RE relocations
+// for field accesses; libbpf / cilium-ebpf rewrites them at load time using
+// the running kernel's BTF, so the local layout below is irrelevant —
+// only field names matter, and only the named fields need to be present.
+struct ns_common {
+    unsigned int inum;
+} __attribute__((preserve_access_index));
+
+struct mnt_namespace {
+    struct ns_common ns;
+} __attribute__((preserve_access_index));
+
+struct nsproxy {
+    struct mnt_namespace *mnt_ns;
+} __attribute__((preserve_access_index));
+
+struct task_struct {
+    struct nsproxy *nsproxy;
+} __attribute__((preserve_access_index));
+
+// Set by userspace via cilium/ebpf RewriteConstants() before load. Holds the
+// inode number of the mount namespace ratpak itself runs in (i.e. the host
+// mntns). Events from this mntns are filtered out — they're flatpak setup
+// work that runs before bwrap unshares.
+const volatile __u32 host_mntns_inum = 0;
+
+static __always_inline __u32 current_mntns(void)
+{
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    return BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
+}
+
+// should_emit returns true iff the current task is in the tracked set AND
+// in a different mount namespace from the host — i.e. inside a flatpak
+// sandbox after bwrap has unshared.
+static __always_inline int should_emit(void)
 {
     __u32 tid = (__u32)bpf_get_current_pid_tgid();
-    return bpf_map_lookup_elem(&tracked_pids, &tid) != NULL;
+    if (!bpf_map_lookup_elem(&tracked_pids, &tid))
+        return 0;
+    return current_mntns() != host_mntns_inum;
 }
 
 static __always_inline int on_enter(struct sys_enter_args *ctx, int filename_arg_idx)
 {
-    if (!is_tracked())
+    if (!should_emit())
         return 0;
     __u32 tid = (__u32)bpf_get_current_pid_tgid();
     __u64 fnp = (__u64)ctx->args[filename_arg_idx];
@@ -101,7 +140,7 @@ static __always_inline int on_enter(struct sys_enter_args *ctx, int filename_arg
 
 static __always_inline int on_exit(struct sys_exit_args *ctx)
 {
-    if (!is_tracked())
+    if (!should_emit())
         return 0;
     __u32 tid = (__u32)bpf_get_current_pid_tgid();
     __u64 *fnp = bpf_map_lookup_elem(&pending, &tid);

@@ -13,10 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"ratpak/internal/flatpak"
-	"ratpak/internal/observer"
 	ebpfobs "ratpak/internal/observer/ebpf"
 	"ratpak/internal/trace"
 )
@@ -144,9 +142,6 @@ func cmdObserve(args []string) error {
 	fmt.Fprintf(os.Stderr, "ratpak: launched %s as PID %d (Ctrl-C to stop)\n", appID, cmd.Process.Pid)
 	fmt.Fprintf(os.Stderr, "ratpak: writing trace to %s\n", w.Path)
 
-	tracker := observer.NewPIDTracker(cmd.Process.Pid, 50*time.Millisecond)
-	go tracker.Run(ctx)
-
 	go func() {
 		_ = cmd.Wait()
 		cancel()
@@ -154,9 +149,6 @@ func cmdObserve(args []string) error {
 
 	seen := make(map[string]struct{})
 	for ev := range events {
-		if !tracker.IsSandboxed(ev.PID) {
-			continue // host-mntns event (flatpak runner setup, etc.)
-		}
 		if isSetupComm(ev.Comm) {
 			continue // bwrap / ldconfig running inside the sandbox
 		}

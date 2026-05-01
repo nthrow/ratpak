@@ -232,9 +232,9 @@ Numbered to sort, not to gate: items in earlier phases are prerequisites for eve
 
 1. **`make setcap`** target — daily-use observation as user, no doas/sudo prompt per run. *Done.*
 2. **`flatpak.ResolveAppID(pid int)`** — read `[Application]/name=` from `/proc/<pid>/root/.flatpak-info`. *Done.*
-3. **Kernel-side fork tracking** — `tracked_pids` LRU hash + `sched_process_fork` / `sched_process_exit` hooks in `openat.bpf.c`; `Observer.AddRoot(pid)` to seed it. Tracking by kernel TID rather than TGID sidesteps the lack of `task_struct->tgid` in the fork tracepoint context (no vmlinux/BTF dep). The userspace `pidtracker.go` still runs for now — it owns the mntns check, which the BPF program doesn't yet do. *Done; validated against Flatseal.*
+3. **Kernel-side fork tracking** — `tracked_pids` LRU hash + `sched_process_fork` / `sched_process_exit` hooks in `openat.bpf.c`; `Observer.AddRoot(pid)` to seed it. Tracking by kernel TID rather than TGID sidesteps the lack of `task_struct->tgid` in the fork tracepoint context. *Done.*
 4. **`internal/daemon/` package skeleton** — package doc, IPC socket-path convention, Server stub. *Done.*
-5. **Mount-namespace check in BPF** — read `task->nsproxy->mnt_ns->ns.inum` via CO-RE, compare to a host_mntns_inum global. Lets `pidtracker.go` retire entirely. *Next.*
+5. **Mount-namespace check in BPF** — minimal `task_struct → nsproxy → mnt_namespace → ns_common` chain with `preserve_access_index` so CO-RE rewrites field offsets at load time. `host_mntns_inum` rodata global, set by userspace from `/proc/self/ns/mnt` before load via `VariableSpec.Set`. The combined `should_emit()` check (tracked tid AND mntns differs from host) replaces the userspace `IsSandboxed`. `pidtracker.go` retired. *Done.*
 
 ### Lesson learned during P0 item 3
 

@@ -4,11 +4,17 @@
 // tracepoints, captures pid/tgid/comm and the requested path, and ships
 // each open() to userspace via a ring buffer.
 //
-// Membership in the "tracked" set is maintained kernel-side: a hash map
-// keyed by kernel TID, seeded by Observer.AddRoot, propagated by a
-// sched_process_fork hook, and reaped by sched_process_exit. The openat
-// hooks early-exit when the calling TID isn't tracked, so non-flatpak
-// processes never reach userspace.
+// Filtering is done entirely kernel-side via two checks per event:
+//   - the calling thread's TID must be in the `tracked_pids` LRU hash,
+//     seeded by Observer.AddRoot and propagated to descendants by a
+//     sched_process_fork hook;
+//   - the calling task's mount-namespace inum must differ from the host's
+//     (set into a rodata global at load time, read at event time via a
+//     CO-RE relocation against task->nsproxy->mnt_ns->ns.inum).
+//
+// Together these reproduce what the userspace pidtracker.go used to do, at
+// the cost of one extra map lookup per syscall and a CO-RE-relocated read
+// of three task_struct fields. The userspace stream is now pre-filtered.
 package ebpfobs
 
 import (
@@ -19,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -59,8 +66,21 @@ func (o *Observer) Observe(ctx context.Context, _ string) (<-chan observer.Event
 		fmt.Fprintf(os.Stderr, "ratpak: warn: remove memlock: %v\n", err)
 	}
 
+	hostMntns, err := selfMntnsInum()
+	if err != nil {
+		return nil, fmt.Errorf("read self mntns: %w", err)
+	}
+
+	spec, err := loadOpenat()
+	if err != nil {
+		return nil, fmt.Errorf("load bpf spec: %w", err)
+	}
+	if err := spec.Variables["host_mntns_inum"].Set(hostMntns); err != nil {
+		return nil, fmt.Errorf("set host_mntns_inum: %w", err)
+	}
+
 	objs := &openatObjects{}
-	if err := loadOpenatObjects(objs, nil); err != nil {
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("load bpf objects: %w", err)
 	}
 
@@ -173,4 +193,20 @@ func cstr(b []byte) string {
 		b = b[:i]
 	}
 	return string(b)
+}
+
+// selfMntnsInum returns the inode number of /proc/self/ns/mnt — the mount
+// namespace ratpak itself runs in. The BPF program treats this as the host
+// mntns and filters out events from it (i.e. flatpak's pre-bwrap setup).
+//
+// Assumes ratpak runs in the host mntns. If ratpak is itself launched
+// inside a sandbox or container, this would treat that sandbox's mntns as
+// "host" and miss filtering — fix at that point would be to read PID 1's
+// mntns instead.
+func selfMntnsInum() (uint32, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat("/proc/self/ns/mnt", &st); err != nil {
+		return 0, err
+	}
+	return uint32(st.Ino), nil
 }
