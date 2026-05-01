@@ -33,7 +33,10 @@ commands:
   profile <appid> [trace]    classify saved traces into used / unused / unaccounted.
                              With no arg, unions every saved trace for the app.
                              With a path or '-' (stdin), classifies that single trace.
-  apply <appid>              apply minimal overrides based on observation (not yet implemented)
+  apply <appid> [--commit]   revoke filesystem grants that had zero hits across all
+                             saved sessions (dry-run by default; pass --commit to write)
+  reset <appid> [--commit]   remove ALL user overrides for the app (dry-run by default;
+                             broader than apply — also clears dbus/socket overrides)
 `
 
 func main() {
@@ -58,6 +61,8 @@ func main() {
 		err = cmdProfile(args[1:])
 	case "apply":
 		err = cmdApply(args[1:])
+	case "reset":
+		err = cmdReset(args[1:])
 	case "help", "-h", "--help":
 		flag.Usage()
 		return
@@ -178,8 +183,168 @@ func isSetupComm(comm string) bool {
 	return false
 }
 
-func cmdApply(_ []string) error {
-	return fmt.Errorf("apply: not yet implemented")
+func cmdApply(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("apply: expected <appid> [--commit]")
+	}
+	appID := args[0]
+	commit := false
+	for _, a := range args[1:] {
+		switch a {
+		case "--commit":
+			commit = true
+		default:
+			return fmt.Errorf("apply: unknown flag %q", a)
+		}
+	}
+	if commit && os.Geteuid() == 0 {
+		return fmt.Errorf("apply --commit: don't run as root — overrides go to your user's flatpak config; run as the invoking user")
+	}
+
+	home, uid, _ := invokingUser()
+
+	files, err := trace.ListFiles(home, appID)
+	if err != nil {
+		return fmt.Errorf("list traces: %w", err)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no saved traces for %s; run 'ratpak observe %s' first", appID, appID)
+	}
+	var sessions []map[string]struct{}
+	for _, f := range files {
+		recs, err := trace.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f, err)
+		}
+		sessions = append(sessions, pathSet(recs))
+	}
+
+	requested, err := flatpak.RequestedPermissions(appID)
+	if err != nil {
+		return fmt.Errorf("read manifest: %w", err)
+	}
+
+	type unusedTerm struct {
+		raw    string
+		stripped string
+	}
+	var unused []unusedTerm
+	for _, raw := range requested.Filesystems {
+		if strings.HasPrefix(raw, "!") {
+			continue // already a manifest-side negation
+		}
+		t, _ := flatpak.ResolveFilesystemTerm(raw, home, uid)
+		if t.Path == "" {
+			continue // unresolved term — don't presume to revoke it
+		}
+		hit := false
+		for _, s := range sessions {
+			for p := range s {
+				if flatpak.PathUnder(p, t.Path) {
+					hit = true
+					break
+				}
+			}
+			if hit {
+				break
+			}
+		}
+		if !hit {
+			unused = append(unused, unusedTerm{raw: raw, stripped: stripMode(raw)})
+		}
+	}
+
+	fmt.Printf("App: %s\n", appID)
+	fmt.Printf("Sessions: %d\n", len(sessions))
+	if len(unused) == 0 {
+		fmt.Println("No unused filesystem grants — nothing to apply.")
+		return nil
+	}
+
+	if !commit {
+		fmt.Printf("\nWould revoke %d filesystem grant(s) (dry-run; pass --commit to apply):\n", len(unused))
+		for _, u := range unused {
+			fmt.Printf("  flatpak override --user --nofilesystem=%s %s\n", u.stripped, appID)
+		}
+		if len(sessions) < 3 {
+			fmt.Printf("\nWarning: based on only %d session(s) of observation. Consider capturing more before --commit.\n", len(sessions))
+		}
+		return nil
+	}
+
+	fmt.Printf("\nApplying %d revocation(s)...\n", len(unused))
+	failed := 0
+	for _, u := range unused {
+		if err := flatpak.AddNoFilesystem(appID, u.stripped); err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  --nofilesystem=%s: %v\n", u.stripped, err)
+			failed++
+			continue
+		}
+		fmt.Printf("  done  --nofilesystem=%s\n", u.stripped)
+	}
+	if failed > 0 {
+		return fmt.Errorf("apply: %d/%d revocations failed", failed, len(unused))
+	}
+	fmt.Printf("\nDone. To undo all user overrides for this app: ratpak reset %s --commit\n", appID)
+	return nil
+}
+
+func cmdReset(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("reset: expected <appid> [--commit]")
+	}
+	appID := args[0]
+	commit := false
+	for _, a := range args[1:] {
+		switch a {
+		case "--commit":
+			commit = true
+		default:
+			return fmt.Errorf("reset: unknown flag %q", a)
+		}
+	}
+	if commit && os.Geteuid() == 0 {
+		return fmt.Errorf("reset --commit: don't run as root — overrides live in your user's flatpak config")
+	}
+
+	overrides, err := flatpak.UserOverrides(appID)
+	if err != nil {
+		return fmt.Errorf("read overrides: %w", err)
+	}
+
+	fmt.Printf("App: %s\n", appID)
+	fmt.Println("Current user overrides — filesystems:")
+	if len(overrides.Filesystems) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		for _, f := range overrides.Filesystems {
+			fmt.Printf("  %s\n", f)
+		}
+	}
+
+	if !commit {
+		fmt.Println("\nWould reset ALL user overrides (filesystems, dbus, sockets, …) for this app — dry-run.")
+		fmt.Printf("Run 'ratpak reset %s --commit' to apply.\n", appID)
+		return nil
+	}
+
+	if err := flatpak.ResetUser(appID); err != nil {
+		return err
+	}
+	fmt.Println("\nDone. All user overrides for this app removed.")
+	return nil
+}
+
+// stripMode returns a flatpak filesystem term without its mode suffix
+// (:ro / :rw / :create). flatpak's --nofilesystem rejects mode suffixes.
+func stripMode(raw string) string {
+	if i := strings.LastIndexByte(raw, ':'); i > 0 {
+		switch raw[i+1:] {
+		case "ro", "rw", "create":
+			return raw[:i]
+		}
+	}
+	return raw
 }
 
 func cmdProfile(args []string) error {
