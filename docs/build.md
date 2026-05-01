@@ -25,7 +25,10 @@ make generate   # `go generate ./...` (regenerates bpf2go bindings)
 make build      # generate + build, output to bin/ratpak
 make shell      # interactive shell in the container, source bind-mounted at /work
 make clean      # remove bin/
+make setcap     # grant cap_bpf,cap_perfmon+ep on bin/ratpak (requires doas)
 ```
+
+`make setcap` is a separate, privileged target — `build` produces the binary as your user, then `setcap` invokes `doas` once to grant the BPF capabilities. Day-to-day `observe` runs (and the future daemon) work as your normal user afterwards. Verify with `getcap bin/ratpak`.
 
 `make build` always re-runs `go generate ./...` first, so any change to `openat.bpf.c` is picked up.
 

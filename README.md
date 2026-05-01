@@ -82,6 +82,7 @@ A single session won't justify revocation by itself; the more sessions you obser
 ## Documentation
 
 - [Status & roadmap](docs/roadmap.md) — where v1 stands, what v2 should fix, where to resume
+- [Daemon design](docs/daemon-design.md) — target architecture for an always-on, per-user agent (Little-Snitch-style)
 - [Architecture overview](docs/architecture.md) — terminology and data flow
 - [CLI commands](docs/cli.md)
 - [`internal/flatpak`](docs/flatpak-package.md) — manifest, overrides, term resolution, override writers
