@@ -191,13 +191,14 @@ Each filesystem term gets a static risk score 0-10 indicating the blast radius o
 | `xdg-music:ro`       | 1     | Niche.                                                          |
 | `/var/lib/flatpak/*` | 1     | Per-system; usually irrelevant on user-only installs.           |
 
-Used three ways:
+Used (or planned to be used) several ways:
 
-1. **Prompt cadence**: revocation candidates with risk ≥ 8 require ≥ 30 sessions of zero-hits before prompting; risk ≤ 3 require ≥ 5. Prevents the daemon from nagging about `home` after one quiet day.
-2. **Followup cadence**: higher-risk revocations stay on the followup watch list longer (e.g. risk 10 watched for 60 days, risk 1 for 7).
-3. **UX hint in prompts**: "low-risk" revocations get a one-click apply button; "high-risk" require a confirmation step.
+1. **Daemon enforcement level cap** (live): `--level N` on `ratpak daemon` caps the max risk score that auto-revocation will touch. Level 1=trivial (≤ 2), 2=default (≤ 4), 3=strict (≤ 6), 4=aggressive (≤ 10). See [`docs/cli.md`](cli.md).
+2. **Prompt cadence** (planned): revocation candidates with risk ≥ 8 require ≥ 30 sessions of zero-hits before prompting; risk ≤ 3 require ≥ 5. Prevents nagging about `home` after one quiet day. Currently the daemon uses a single hard floor of 3 sessions regardless of risk; tunable per-risk thresholds come with the prompt UI.
+3. **Followup cadence** (planned): higher-risk revocations stay on the followup watch list longer (e.g. risk 10 watched for 60 days, risk 1 for 7).
+4. **UX hint in prompts** (planned): "low-risk" revocations get a one-click apply button; "high-risk" require a confirmation step.
 
-Scores live in a Go map in `internal/flatpak/risk.go` (when written), keyed by canonicalized term. Unknown terms default to 5.
+Scores live in [`internal/flatpak/risk.go`](../internal/flatpak/risk.go), keyed by canonicalized term. Unknown terms default to 5 — neither a free pass nor an outright veto. `LevelRiskCap(level)` exposes the level → max-risk mapping.
 
 ## Follow-up watch list
 
@@ -242,10 +243,14 @@ Different `sched/*` tracepoints use different context-struct layouts (some use `
 
 ### P1 — Daemon proper
 
-5. `ratpak daemon` foreground command; loads the eBPF program once and runs the ringbuf reader as a long-lived process.
-6. Per-app session boundary tracker (open session on first tracked TGID for an appid, close on last exit).
-7. Sqlite state store; backfill existing jsonl traces into it on first daemon startup.
-8. IPC server with `status`, `list_apps`, `get_profile` (read-only methods first).
+5. `ratpak daemon` foreground command; loads the eBPF program once and runs the ringbuf reader as a long-lived process. *Done.*
+6. Process discovery — periodic `/proc` walk for flatpak'd processes via `flatpak.ResolveAppID`, seeding the kernel-side tracked set; BPF `sched_process_fork` propagates to descendants. *Done.*
+7. Per-app event demux — userspace cache `tgid → appid` (filled from `.flatpak-info` lazily on first event from each tgid), one `trace.Writer` per active appid. *Done.*
+8. **Scope** — `--app` / `--exclude` flags restrict which apps the daemon attends to. *Done.*
+9. **Mode + level** — `--mode permissive|enforcing`, `--level 1..4`. Enforcing mode runs an analysis loop every 15 minutes that auto-revokes unused grants whose `RiskScore` is within the level's cap. Hard floor of 3 sessions of zero-hits before any revocation fires. Refuses to run enforcing as root (overrides go to `flatpak --user`'s identity). *Done.*
+10. Sqlite state store; backfill existing jsonl traces into it on first daemon startup. *Pending.*
+11. Per-app-launch session boundaries (open on first tgid for an appid, close on last exit). Currently a "session" is one daemon run. *Pending; needs a process-exit signal — either revive a userspace `/proc` poller or have the BPF `sched_process_exit` hook also notify userspace.*
+12. IPC server with `status`, `list_apps`, `get_profile` (read-only methods first). *Pending.*
 
 ### P2 — Analysis + prompts
 

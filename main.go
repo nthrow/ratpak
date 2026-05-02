@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 
+	"ratpak/internal/daemon"
 	"ratpak/internal/flatpak"
 	ebpfobs "ratpak/internal/observer/ebpf"
 	"ratpak/internal/trace"
@@ -35,6 +36,11 @@ commands:
                              saved sessions (dry-run by default; pass --commit to write)
   reset <appid> [--commit]   remove ALL user overrides for the app (dry-run by default;
                              broader than apply — also clears dbus/socket overrides)
+  daemon [flags]             run as a long-lived per-user agent. Flags:
+                               --app <id>       limit to this appid (repeatable)
+                               --exclude <id>   skip this appid (repeatable)
+                               --mode <m>       permissive (default) | enforcing
+                               --level <1..4>   enforcing aggression (default 2)
 `
 
 func main() {
@@ -61,6 +67,8 @@ func main() {
 		err = cmdApply(args[1:])
 	case "reset":
 		err = cmdReset(args[1:])
+	case "daemon":
+		err = cmdDaemon(args[1:])
 	case "help", "-h", "--help":
 		flag.Usage()
 		return
@@ -245,7 +253,7 @@ func cmdApply(args []string) error {
 			}
 		}
 		if !hit {
-			unused = append(unused, unusedTerm{raw: raw, stripped: stripMode(raw)})
+			unused = append(unused, unusedTerm{raw: raw, stripped: flatpak.StripMode(raw)})
 		}
 	}
 
@@ -283,6 +291,63 @@ func cmdApply(args []string) error {
 	fmt.Printf("\nDone. To undo all user overrides for this app: ratpak reset %s --commit\n", appID)
 	return nil
 }
+
+func cmdDaemon(args []string) error {
+	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var include, exclude appList
+	fs.Var(&include, "app", "limit to this appid; repeatable. Default: all flatpak apps.")
+	fs.Var(&exclude, "exclude", "skip this appid; repeatable.")
+	mode := fs.String("mode", "permissive",
+		"permissive | enforcing. Permissive observes & persists traces; enforcing also auto-revokes unused grants.")
+	level := fs.Int("level", 2,
+		"1..4 (only used in enforcing mode); higher = more aggressive auto-revocation. "+
+			"1 cap risk≤2 (xdg-pictures, xdg-music, …); 2 cap risk≤4 (xdg-download, pipewire, …); "+
+			"3 cap risk≤6 (xdg-config, xdg-data, host-etc); 4 cap risk≤10 (home, host).")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("daemon: unexpected positional arg %q", fs.Arg(0))
+	}
+
+	var dmode daemon.Mode
+	switch *mode {
+	case "permissive":
+		dmode = daemon.ModePermissive
+	case "enforcing":
+		dmode = daemon.ModeEnforcing
+	default:
+		return fmt.Errorf("daemon: unknown --mode %q (want permissive | enforcing)", *mode)
+	}
+	if dmode == daemon.ModeEnforcing && (*level < 1 || *level > 4) {
+		return fmt.Errorf("daemon: --level must be in 1..4 for enforcing mode (got %d)", *level)
+	}
+
+	home, uid, gid := invokingUser()
+	srv := &daemon.Server{
+		SocketPath:  daemon.SocketPath(),
+		StateDir:    daemon.StateDir(),
+		Home:        home,
+		UID:         uid,
+		GID:         gid,
+		IncludeApps: include,
+		ExcludeApps: exclude,
+		Mode:        dmode,
+		Level:       *level,
+	}
+	ctx, cancel := signalContext()
+	defer cancel()
+	fmt.Fprintf(os.Stderr, "ratpak daemon: trace dir %s\n", srv.StateDir)
+	fmt.Fprintf(os.Stderr, "ratpak daemon: socket path %s (IPC server not yet implemented)\n", srv.SocketPath)
+	return srv.Run(ctx)
+}
+
+// appList is a flag.Value that accumulates repeated --app / --exclude flags.
+type appList []string
+
+func (a *appList) String() string     { return strings.Join(*a, ",") }
+func (a *appList) Set(v string) error { *a = append(*a, v); return nil }
 
 func cmdReset(args []string) error {
 	if len(args) < 1 {
@@ -330,17 +395,6 @@ func cmdReset(args []string) error {
 	return nil
 }
 
-// stripMode returns a flatpak filesystem term without its mode suffix
-// (:ro / :rw / :create). flatpak's --nofilesystem rejects mode suffixes.
-func stripMode(raw string) string {
-	if i := strings.LastIndexByte(raw, ':'); i > 0 {
-		switch raw[i+1:] {
-		case "ro", "rw", "create":
-			return raw[:i]
-		}
-	}
-	return raw
-}
 
 func cmdProfile(args []string) error {
 	if len(args) < 1 {
